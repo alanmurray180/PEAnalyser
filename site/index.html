@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>PE Analyser</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="config.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>PE Analyser</h1>
+      <p id="status" class="status" aria-live="polite">Connecting…</p>
+    </div>
+    <div class="actions">
+      <button id="btn-refresh" class="btn" title="Fetch latest prices now; queue a data refresh">Refresh</button>
+      <button id="btn-settings" class="btn ghost">Settings</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="tiles" id="tiles" aria-label="Basket summary"></section>
+
+    <section class="controls" aria-label="View options">
+      <div class="seg" data-key="metric" role="group" aria-label="Metric">
+        <button data-v="both">Both</button><button data-v="ttm">Trailing</button><button data-v="ntm">Forward</button>
+      </div>
+      <div class="seg" data-key="view" role="group" aria-label="Values">
+        <button data-v="mult">Multiples</button><button data-v="rel">Now vs point</button>
+      </div>
+      <div class="seg" data-key="basis" role="group" aria-label="EPS basis">
+        <button data-v="pit" title="EPS as known at each date">Point-in-time EPS</button><button data-v="cur" title="Today's EPS against each historical price">Current EPS</button>
+      </div>
+      <div class="seg" data-key="filter" role="group" aria-label="Filter">
+        <button data-v="all">All</button><button data-v="stock">Stocks</button><button data-v="etf">ETFs</button>
+      </div>
+    </section>
+
+    <section class="table-wrap" aria-label="PE table">
+      <table id="grid" class="grid"></table>
+    </section>
+    <p class="legend-note" id="legend-note"></p>
+
+    <section class="manage">
+      <div class="card">
+        <h2>Basket</h2>
+        <form id="form-add" class="row-form">
+          <input id="add-symbol" placeholder="Ticker e.g. ASML" autocomplete="off" required maxlength="15" />
+          <select id="add-type" aria-label="Type"><option value="">Auto-detect</option><option value="stock">Stock</option><option value="etf">ETF</option></select>
+          <button class="btn" type="submit">Add</button>
+        </form>
+        <ul id="basket" class="chips"></ul>
+      </div>
+      <div class="card">
+        <h2>Reference dates</h2>
+        <form id="form-event" class="row-form">
+          <input id="ev-date" type="date" required />
+          <input id="ev-label" placeholder="Label e.g. Fed pivot" maxlength="60" />
+          <button class="btn" type="submit">Add</button>
+        </form>
+        <ul id="events" class="chips"></ul>
+      </div>
+    </section>
+
+    <details class="card method">
+      <summary>Method and caveats</summary>
+      <ul>
+        <li><b>Trailing PE</b> = price ÷ sum of the last four reported quarterly EPS, using only quarters reported on or before that date (point-in-time).</li>
+        <li><b>Forward PE</b> = price ÷ next-12-months EPS, time-weighted across fiscal quarters. Today: consensus. Historical dates: actuals reported since (hindsight) plus consensus for any unreported quarters — providers do not supply historical consensus snapshots. Hover a cell for the estimate share.</li>
+        <li><b>52-week high/low</b> use intraday extremes over the trailing 365 days, split-adjusted, extended live if today breaks through.</li>
+        <li><b>Reference dates</b> use the close on or before the date.</li>
+        <li><b>ETFs</b>: look-through earnings of the top holdings (units held per ETF share fixed at the latest holdings snapshot), scaled for weight coverage. Equivalent to a harmonic-mean PE; loss-makers count. Accuracy falls for dates far back as holdings change.</li>
+        <li><b>EPS basis</b>: Alpha Vantage reported EPS (Street/adjusted basis) where available; FMP GAAP diluted EPS as fallback — flagged on the row if bases are mixed.</li>
+        <li>Negative or zero EPS shows as <b>n/m</b>.</li>
+      </ul>
+    </details>
+  </main>
+
+  <dialog id="detail" class="detail">
+    <div class="detail-head">
+      <div><h2 id="d-title"></h2><p id="d-sub" class="muted"></p></div>
+      <button class="btn ghost" id="d-close" aria-label="Close">Close</button>
+    </div>
+    <div id="d-body"></div>
+  </dialog>
+
+  <dialog id="settings" class="detail narrow">
+    <form method="dialog" id="settings-form">
+      <h2>Settings</h2>
+      <label>API URL<input id="s-api" type="url" required /></label>
+      <label>Access token<input id="s-token" type="password" autocomplete="off" /></label>
+      <p class="muted">Stored in this browser only. The token is the <code>DASHBOARD_TOKEN</code> secret set on the Worker.</p>
+      <div class="row-form end"><button class="btn ghost" value="cancel">Cancel</button><button class="btn" value="save">Save</button></div>
+    </form>
+  </dialog>
+
+  <div id="tip" class="tip" role="tooltip" hidden></div>
+</body>
+</html>
