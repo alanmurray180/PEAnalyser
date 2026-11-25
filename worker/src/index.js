@@ -2,7 +2,7 @@
 // Secrets (wrangler secret put): AV_API_KEY, FMP_API_KEY, DASHBOARD_TOKEN (optional but recommended)
 
 import { loadConfig, saveConfig, loadState, kvGet, runRefresh, rebuildBase, symbolDetail, cfgNum } from './store.js';
-import { Budget, fetchQuotes } from './providers.js';
+import { Budget, fetchQuotes, avDiagnose } from './providers.js';
 import { mergeLive } from './calc.js';
 import { canonSymbol, isoDate, todayISO } from './util.js';
 
@@ -38,7 +38,7 @@ async function liveQuotes(env, symbols) {
   const key = symbols.slice().sort().join(',');
   const ttl = cfgNum(env, 'QUOTE_TTL_SECONDS', 15) * 1000;
   if (quoteCache.key === key && Date.now() - quoteCache.at < ttl) return quoteCache;
-  const budget = new Budget(cfgNum(env, 'QUOTE_AV_CAP', 45), 600);
+  const budget = new Budget(cfgNum(env, 'QUOTE_AV_CAP', 20), 300);
   const data = await fetchQuotes(env, budget, symbols);
   quoteCache = { at: Date.now(), key, data, notes: data.notes || [] };
   return quoteCache;
@@ -73,7 +73,7 @@ async function dashboard(env, ctx) {
     status: {
       pending,
       lastRun: state.lastRun || null,
-      errorCount: Object.values(state.syms).filter((v) => v.errors && Object.keys(v.errors).length).length,
+      errorCount: Object.values(state.syms).filter((v) => Object.values(v.errors || {}).some((e) => e.v === 2)).length,
     },
   };
 }
@@ -91,11 +91,13 @@ export default {
     try {
       if (req.method === 'GET' && path === '/api/dashboard') return json(await dashboard(env, ctx), 200, cors);
 
+      if (req.method === 'GET' && path === '/api/avcheck') return json(await avDiagnose(env), 200, cors);
+
       if (req.method === 'GET' && path === '/api/config') return json(await loadConfig(env), 200, cors);
 
       if (req.method === 'GET' && path === '/api/status') {
         const state = await loadState(env);
-        const syms = Object.entries(state.syms).map(([s, v]) => ({ symbol: s, type: v.meta?.type, fundAt: v.fundAt, histAt: v.histAt, etfAt: v.etfAt, errors: v.errors }));
+        const syms = Object.entries(state.syms).map(([s, v]) => ({ symbol: s, type: v.meta?.type, fundAt: v.fundAt, histAt: v.histAt, etfAt: v.etfAt, errors: Object.fromEntries(Object.entries(v.errors || {}).filter(([, e]) => e.v === 2)) }));
         return json({ lastRun: state.lastRun, baseAt: state.baseAt, syms }, 200, cors);
       }
 

@@ -5,6 +5,23 @@ import { num, sleep, canonSymbol, round } from './util.js';
 
 export class RateLimitError extends Error {}
 export class PremiumError extends Error {}
+/** AV says the key is a free key: every further call this run would fail the same way. */
+export class FreeKeyError extends RateLimitError {}
+
+/**
+ * Classify an Alpha Vantage "Information"/"Note"/"Error Message" text. Order matters: plan-feature
+ * messages mention "requests per minute" too, and must not be read as rate limits.
+ */
+export function classifyAvMessage(msg) {
+  const m = String(msg || '');
+  if (/standard api (call )?(rate )?limit|25 (api )?requests per day|requests per day/i.test(m)) return 'free-key';
+  if (/premium endpoint|is a premium|premium (feature|function|data)|entitlement|realtime|real-time|delayed|subscribe to (a|the|any)/i.test(m)) return 'plan';
+  if (/spreading out|per second|call volume|frequency|rate limit|too many/i.test(m)) return 'rate';
+  if (/invalid api call|invalid api key|apikey is invalid/i.test(m)) return 'invalid';
+  return 'other';
+}
+
+export const avKey = (env) => String(env.AV_API_KEY || '').trim();
 
 /** Shared call budget + throttle for one worker invocation. */
 export class Budget {
@@ -32,19 +49,24 @@ const avSym = (s) => canonSymbol(s); // AV accepts BRK-B style
 const AV_URL = 'https://www.alphavantage.co/query';
 
 export async function av(env, budget, params) {
-  if (!env.AV_API_KEY) throw new Error('AV_API_KEY not configured');
+  const key = avKey(env);
+  if (!key) throw new Error('AV_API_KEY not configured');
   await budget.spendAv();
   const u = new URL(AV_URL);
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
-  u.searchParams.set('apikey', env.AV_API_KEY);
+  u.searchParams.set('apikey', key);
   const res = await fetch(u.toString(), { headers: { 'User-Agent': 'pe-analyser-worker' } });
+  if (res.status === 429) throw new RateLimitError('Alpha Vantage HTTP 429');
   if (!res.ok) throw new Error(`Alpha Vantage HTTP ${res.status}`);
   const j = await res.json();
   const msg = j['Error Message'] || j.Note || j.Information;
   if (msg) {
-    if (/frequency|rate limit|per minute|per day|spreading out|call volume|higher api/i.test(msg)) throw new RateLimitError(`Alpha Vantage: ${msg}`);
-    if (/premium/i.test(msg)) throw new PremiumError(`Alpha Vantage: ${msg}`);
-    throw new Error(`Alpha Vantage: ${msg}`);
+    const kind = classifyAvMessage(msg);
+    const text = `Alpha Vantage (${params.function}): ${msg}`;
+    if (kind === 'free-key') throw new FreeKeyError(`Alpha Vantage is treating the API key as a FREE key (25 calls/day). Check the AV_API_KEY secret matches your premium key exactly. ${text}`);
+    if (kind === 'rate') throw new RateLimitError(text);
+    if (kind === 'plan') throw new PremiumError(text);
+    throw new Error(text);
   }
   return j;
 }
@@ -79,7 +101,6 @@ export async function avHistory(env, budget, symbol, fromDate, compact = false) 
     function: 'TIME_SERIES_DAILY_ADJUSTED',
     symbol: avSym(symbol),
     outputsize: compact ? 'compact' : 'full',
-    entitlement: env.AV_ENTITLEMENT || undefined,
   });
   const ts = j['Time Series (Daily)'];
   if (!ts) throw new Error('Alpha Vantage returned no daily series');
@@ -115,12 +136,38 @@ export async function avEtfHoldings(env, budget, symbol) {
   return items;
 }
 
-/** Up to 100 symbols per call; premium endpoint. */
+// Plan capabilities learned at runtime (per isolate), so page polls don't keep spending calls on
+// features the plan lacks. Re-tested every 6 hours.
+const caps = { bulkOffUntil: 0, entitlementOffUntil: 0 };
+const CAP_RETRY_MS = 6 * 3600000;
+const entitlement = (env) => (env.AV_ENTITLEMENT && Date.now() > caps.entitlementOffUntil ? env.AV_ENTITLEMENT : undefined);
+
+async function avWithEntitlement(env, budget, params) {
+  const ent = entitlement(env);
+  try {
+    return await av(env, budget, { ...params, entitlement: ent });
+  } catch (e) {
+    if (ent && e instanceof PremiumError) {
+      caps.entitlementOffUntil = Date.now() + CAP_RETRY_MS; // plan lacks it: use the default feed
+      return av(env, budget, params);
+    }
+    throw e;
+  }
+}
+
+/** Up to 100 symbols per call; needs AV's higher premium tiers. */
 export async function avBulkQuotes(env, budget, symbols) {
   const out = new Map();
+  if (Date.now() < caps.bulkOffUntil) throw new PremiumError('REALTIME_BULK_QUOTES not on this plan (cached)');
   for (let i = 0; i < symbols.length; i += 100) {
     const chunk = symbols.slice(i, i + 100);
-    const j = await av(env, budget, { function: 'REALTIME_BULK_QUOTES', symbol: chunk.map(avSym).join(','), entitlement: env.AV_ENTITLEMENT || undefined });
+    let j;
+    try {
+      j = await avWithEntitlement(env, budget, { function: 'REALTIME_BULK_QUOTES', symbol: chunk.map(avSym).join(',') });
+    } catch (e) {
+      if (e instanceof PremiumError) caps.bulkOffUntil = Date.now() + CAP_RETRY_MS;
+      throw e;
+    }
     for (const q of j.data || []) {
       const price = num(q.close);
       if (price === null) continue;
@@ -140,7 +187,7 @@ export async function avBulkQuotes(env, budget, symbols) {
 }
 
 export async function avGlobalQuote(env, budget, symbol) {
-  const j = await av(env, budget, { function: 'GLOBAL_QUOTE', symbol: avSym(symbol), entitlement: env.AV_ENTITLEMENT || undefined });
+  const j = await avWithEntitlement(env, budget, { function: 'GLOBAL_QUOTE', symbol: avSym(symbol) });
   const q = j['Global Quote'] || {};
   const price = num(q['05. price']);
   if (price === null) return null;
@@ -154,6 +201,45 @@ export async function avGlobalQuote(env, budget, symbol) {
     time: q['07. latest trading day'] || null,
     source: 'Alpha Vantage',
   };
+}
+
+/** Raw probe of the key and plan features, for the dashboard's Data status panel. */
+export async function avDiagnose(env) {
+  const key = avKey(env);
+  const raw = String(env.AV_API_KEY || '');
+  const out = {
+    key: { set: !!key, length: key.length, last4: key.slice(-4), hadWhitespace: raw !== key },
+    probes: [],
+  };
+  const probe = async (label, params) => {
+    const u = new URL(AV_URL);
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    u.searchParams.set('apikey', key);
+    try {
+      const res = await fetch(u.toString());
+      const j = await res.json().catch(() => ({}));
+      const msg = j['Error Message'] || j.Note || j.Information || null;
+      out.probes.push({ label, http: res.status, ok: !msg, kind: msg ? classifyAvMessage(msg) : 'ok', message: msg ? String(msg).slice(0, 400) : null });
+    } catch (e) {
+      out.probes.push({ label, ok: false, kind: 'network', message: e.message });
+    }
+  };
+  await probe('Earnings (EARNINGS)', { function: 'EARNINGS', symbol: 'IBM' });
+  await probe('Estimates (EARNINGS_ESTIMATES)', { function: 'EARNINGS_ESTIMATES', symbol: 'IBM' });
+  await probe('Daily history (TIME_SERIES_DAILY_ADJUSTED)', { function: 'TIME_SERIES_DAILY_ADJUSTED', symbol: 'IBM', outputsize: 'compact' });
+  await probe('ETF holdings (ETF_PROFILE)', { function: 'ETF_PROFILE', symbol: 'QQQ' });
+  await probe('Quote (GLOBAL_QUOTE)', { function: 'GLOBAL_QUOTE', symbol: 'IBM' });
+  if (env.AV_ENTITLEMENT) await probe(`Quote with entitlement=${env.AV_ENTITLEMENT}`, { function: 'GLOBAL_QUOTE', symbol: 'IBM', entitlement: env.AV_ENTITLEMENT });
+  await probe('Bulk quotes (REALTIME_BULK_QUOTES)', { function: 'REALTIME_BULK_QUOTES', symbol: 'IBM,MSFT' });
+  const kinds = out.probes.map((p) => p.kind);
+  out.verdict = kinds.includes('free-key')
+    ? 'Alpha Vantage is treating this key as a FREE key. The AV_API_KEY secret in Cloudflare does not match your premium key (or the subscription is not active on it).'
+    : kinds.includes('rate')
+      ? 'Rate-limited right now. Something else may be using the same key (another app or dashboard), or the plan limit is lower than AV_CALLS_PER_MIN.'
+      : kinds.slice(0, 4).every((k) => k === 'ok')
+        ? 'Key is recognised and the core endpoints work.' + (kinds.includes('plan') ? ' Some quote features are not on this plan; the Worker falls back automatically.' : '')
+        : 'See the individual results below.';
+  return out;
 }
 
 // ---------------- FMP ----------------

@@ -469,6 +469,21 @@ async function loadDiagnostics() {
   }
 }
 
+async function runAvCheck() {
+  const el = $('#s-avcheck');
+  el.textContent = 'Testing (about 7 Alpha Vantage calls)…';
+  try {
+    const r = await api('/api/avcheck');
+    const k = r.key;
+    el.innerHTML =
+      `<p><b>${esc(r.verdict)}</b></p>` +
+      `<p>Key in Cloudflare: ${k.set ? `${k.length} characters, ending “…${esc(k.last4)}”${k.hadWhitespace ? ' — <span class="warn">had leading/trailing spaces (now trimmed)</span>' : ''}` : '<span class="warn">not set</span>'}</p>` +
+      `<ul class="notes">${r.probes.map((p) => `<li>${p.ok ? '✓' : '✗'} ${esc(p.label)}${p.ok ? '' : ` — <i>${esc(p.kind)}</i>: ${esc(p.message || '')}`}</li>`).join('')}</ul>`;
+  } catch (e) {
+    el.textContent = 'Test failed: ' + e.message;
+  }
+}
+
 function openSettings(msg) {
   const dlg = $('#settings');
   if (S.token || !msg) loadDiagnostics();
@@ -505,6 +520,7 @@ function wire() {
   $('#d-close').addEventListener('click', () => $('#detail').close());
   $('#detail').addEventListener('click', (e) => { if (e.target.id === 'detail') $('#detail').close(); });
   $('#btn-settings').addEventListener('click', () => openSettings());
+  $('#btn-avcheck').addEventListener('click', runAvCheck);
   $('#settings-form').addEventListener('submit', (e) => {
     if (e.submitter?.value !== 'save') return;
     S.apiBase = $('#s-api').value.trim();

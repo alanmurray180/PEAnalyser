@@ -15,6 +15,7 @@ import { todayISO, addDays, canonSymbol } from './util.js';
 
 const H = 3600000;
 const ERROR_BACKOFF_MS = 6 * H;
+const ERR_V = 2; // bump to discard errors recorded by older logic
 
 export const cfgNum = (env, k, d) => {
   const n = Number(env[k]);
@@ -66,7 +67,7 @@ async function loadHoldingsMap(env, cfg, state) {
 
 function recentError(st, kind, now) {
   const e = st?.errors?.[kind];
-  return e && now - e.at < ERROR_BACKOFF_MS;
+  return e && e.v === ERR_V && now - e.at < ERROR_BACKOFF_MS;
 }
 
 /** Decide what needs fetching. Missing data first, then stalest. */
@@ -203,7 +204,7 @@ export async function runRefresh(env, { avCalls, maxMs, force = [] } = {}) {
       }
     } catch (e) {
       if (e instanceof RateLimitError) { log.stoppedBy = 'rate-limit'; log.errors.push(e.message); break; }
-      ((state.syms[task.sym] ||= {}).errors ||= {})[task.kind] = { msg: String(e.message).slice(0, 500), at: Date.now() };
+      ((state.syms[task.sym] ||= {}).errors ||= {})[task.kind] = { msg: String(e.message).slice(0, 500), at: Date.now(), v: ERR_V };
       log.failed++;
       log.errors.push(`${task.sym} ${task.kind}: ${e.message}`);
       changed = true;
@@ -266,7 +267,7 @@ export async function rebuildBase(env, cfg, state) {
     const ent = await loadEntity(env, b.symbol, type, memo);
     const row = computeRow({ symbol: b.symbol, meta: { ...st.meta, type }, epsFn: ent.epsFn, rows: ent.rows, events: cfg.events, today });
     row.updated = { fund: st.fundAt || null, hist: st.histAt || null, etf: st.etfAt || null };
-    row.errors = Object.entries(st.errors || {}).map(([k, v]) => `${k}: ${v.msg}`);
+    row.errors = Object.entries(st.errors || {}).filter(([, v]) => v.v === ERR_V).map(([k, v]) => `${k}: ${v.msg}`);
     if (type === 'stock') {
       row.basis = ent.fund?.basis || null;
       if (ent.fund?.basis?.mixed) row.warnings.push('Actual and estimate EPS come from different providers; bases may differ (GAAP vs adjusted).');
