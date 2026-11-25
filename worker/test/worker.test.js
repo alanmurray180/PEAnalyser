@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../src/index.js';
 import { runRefresh } from '../src/store.js';
+import { fetchHistory, Budget } from '../src/providers.js';
 
 const today = new Date().toISOString().slice(0, 10);
 const addDays = (s, n) => new Date(Date.parse(s + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
@@ -13,6 +14,7 @@ function kv() {
     m,
     async get(k, t) { const v = m.get(k); return v === undefined ? null : t === 'json' ? JSON.parse(v) : v; },
     async put(k, v) { m.set(k, v); },
+    async delete(k) { m.delete(k); },
   };
 }
 
@@ -139,4 +141,55 @@ test('full refresh cycle then dashboard API', async () => {
   assert.ok(d2.rows.find((r) => r.symbol === 'BBB').status === 'ok');
   const xmas = d2.rows.find((r) => r.symbol === 'AAA').events.find((e) => e.id === '2018-12-24');
   assert.equal(xmas.missing, true); // mock data starts 2019; must flag, not crash
+});
+
+test('a run cut off mid-way keeps its progress; the next run resumes', async () => {
+  const calls = [];
+  const real = mockFetch(calls);
+  let n = 0;
+  globalThis.fetch = (url) => (++n > 7 ? new Promise(() => {}) : real(url)); // hangs like a killed isolate
+  const env = { PE_KV: kv(), AV_API_KEY: 'x', AV_CALLS_PER_MIN: '100000' };
+  await env.PE_KV.put('cfg', JSON.stringify({ version: 1, basket: [{ symbol: 'AAA' }, { symbol: 'BBB' }, { symbol: 'ETF1' }], events: [] }));
+  runRefresh(env); // never resolves
+  await new Promise((r) => setTimeout(r, 300));
+  const st = JSON.parse(env.PE_KV.m.get('state'));
+  const doneBefore = Object.values(st.syms).filter((v) => v.meta).length;
+  assert.ok(doneBefore >= 2, 'progress was checkpointed before the cut-off');
+  assert.ok(st.lastRun.done >= 3);
+
+  env.PE_KV.m.delete('lock'); // lock expires (60 s TTL) after a killed run
+  globalThis.fetch = real;
+  const r2 = await runRefresh(env);
+  assert.equal(r2.failed, 0, JSON.stringify(r2.errors));
+  const st2 = JSON.parse(env.PE_KV.m.get('state'));
+  assert.ok(st2.syms.AAA.fundAt && st2.syms.BBB.fundAt && st2.syms.ETF1.etfAt);
+  const metaCalls = calls.filter((c) => c.endsWith('OVERVIEW')).length;
+  assert.equal(metaCalls, 3, 'symbols already identified are not re-fetched');
+  const base = JSON.parse(env.PE_KV.m.get('base'));
+  assert.ok(base.rows.every((r) => r.status === 'ok'));
+});
+
+test('overlapping run is skipped while another holds the lock', async () => {
+  globalThis.fetch = mockFetch([]);
+  const env = { PE_KV: kv(), AV_API_KEY: 'x', AV_CALLS_PER_MIN: '100000' };
+  await env.PE_KV.put('lock', JSON.stringify({ at: Date.now() }));
+  const r = await runRefresh(env);
+  assert.equal(r.skipped, 'another run in progress');
+});
+
+test('price history updates incrementally and refetches in full after a new split', async () => {
+  const calls = [];
+  globalThis.fetch = mockFetch(calls);
+  const env = { AV_API_KEY: 'x' };
+  const b = new Budget(100, 100000);
+  const full = await fetchHistory(env, b, 'BBB', '2019-01-01');
+  assert.equal(full.mode, 'full');
+  const prev = { ...full, rows: full.rows.slice(0, -5) };
+  const inc = await fetchHistory(env, b, 'BBB', '2019-01-01', prev);
+  assert.equal(inc.mode, 'incremental');
+  assert.deepEqual(inc.rows, full.rows);
+  // simulate a split since the last snapshot: stored prices on the old basis (x2)
+  const preSplit = { ...full, rows: full.rows.slice(0, -5).map((r) => [r[0], r[1] * 2, r[2] * 2, r[3] * 2]) };
+  const again = await fetchHistory(env, b, 'BBB', '2019-01-01', preSplit);
+  assert.equal(again.mode, 'full');
 });

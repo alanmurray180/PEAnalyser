@@ -133,7 +133,8 @@ async function runTask(env, budget, task, cfg, state, start) {
       return;
     }
     case 'hist': {
-      const h = await fetchHistory(env, budget, task.sym, start);
+      const prev = st.histFrom && st.histFrom <= start ? await kvGet(env, `hist:${task.sym}`) : null;
+      const h = await fetchHistory(env, budget, task.sym, start, prev);
       await kvPut(env, `hist:${task.sym}`, h);
       st.histAt = Date.now();
       st.histFrom = start;
@@ -153,67 +154,76 @@ async function runTask(env, budget, task, cfg, state, start) {
   }
 }
 
-/** One refresh cycle: fetch what is missing/stale within the call budget, then rebuild the snapshot. */
-export async function runRefresh(env, { avCalls, maxMs = 240000, force = [] } = {}) {
+/**
+ * One refresh cycle. Cloudflare stops background work after ~30 s, so the cycle is time-boxed,
+ * checkpoints state after every task (progress survives a cut-off), and re-plans as it goes
+ * (types and ETF holdings discovered mid-run create new work).
+ */
+export async function runRefresh(env, { avCalls, maxMs, force = [] } = {}) {
   const t0 = Date.now();
+  const limitMs = maxMs ?? cfgNum(env, 'RUN_SECONDS', 20) * 1000;
+  const lock = await kvGet(env, 'lock');
+  if (lock && t0 - lock.at < limitMs + 15000 && !force.length) return { skipped: 'another run in progress' };
+  await env.PE_KV.put('lock', JSON.stringify({ at: t0 }), { expirationTtl: 60 });
+
   const cfg = await loadConfig(env);
   const state = await loadState(env);
   const budget = new Budget(avCalls ?? cfgNum(env, 'AV_CALLS_PER_RUN', 60), cfgNum(env, 'AV_CALLS_PER_MIN', 70));
-  const holdingsMap = await loadHoldingsMap(env, cfg, state);
-  const { tasks, start } = planTasks(env, cfg, state, holdingsMap, t0, new Set(force.map(canonSymbol)));
-  const log = { planned: tasks.length, done: 0, failed: 0, stoppedBy: null, errors: [] };
+  const forced = new Set(force.map(canonSymbol));
+  const attempted = new Set();
+  const log = { done: 0, failed: 0, stoppedBy: null, errors: [] };
+  let remaining = 0;
   let changed = false;
+  const checkpoint = async () => {
+    state.lastRun = { at: t0, ms: Date.now() - t0, avCalls: budget.used, fmpCalls: budget.fmpUsed, ...log, remaining };
+    try { await kvPut(env, 'state', state); } catch { /* KV per-key write rate; next checkpoint will catch up */ }
+  };
 
-  for (const task of tasks) {
-    if (Date.now() - t0 > maxMs) { log.stoppedBy = 'time'; break; }
+  while (true) {
+    if (Date.now() - t0 > limitMs) { log.stoppedBy = 'time'; break; }
+    const holdingsMap = await loadHoldingsMap(env, cfg, state);
+    const { tasks, start } = planTasks(env, cfg, state, holdingsMap, Date.now(), forced);
+    const todo = tasks.filter((t) => !attempted.has(t.sym + ':' + t.kind));
+    remaining = todo.length;
+    const task = todo.find((t) => {
+      const st = state.syms[t.sym];
+      // wait for type detection on basket symbols without an explicit type
+      return t.kind === 'meta' || st?.meta || st?.errors?.meta || !cfg.basket.some((b) => b.symbol === t.sym && !b.type);
+    });
+    if (!task) break;
     if (!budget.canSpend(task.cost)) { log.stoppedBy = 'budget'; break; }
-    const stT = state.syms[task.sym];
-    if (task.kind !== 'meta' && !stT?.meta && !stT?.errors?.meta && cfg.basket.some((b) => b.symbol === task.sym && !b.type)) continue;
+    attempted.add(task.sym + ':' + task.kind);
     try {
-      if ((await runTask(env, budget, task, cfg, state, start)) === false) continue;
-      const st = state.syms[task.sym];
-      if (st.errors) delete st.errors[task.kind];
-      log.done++;
-      changed = true;
+      const r = await runTask(env, budget, task, cfg, state, start);
+      if (r !== false) {
+        const st = state.syms[task.sym];
+        if (st.errors) delete st.errors[task.kind];
+        log.done++;
+        changed = true;
+      }
     } catch (e) {
       if (e instanceof RateLimitError) { log.stoppedBy = 'rate-limit'; log.errors.push(e.message); break; }
-      const st = (state.syms[task.sym] ||= {});
-      (st.errors ||= {})[task.kind] = { msg: String(e.message).slice(0, 500), at: Date.now() };
+      ((state.syms[task.sym] ||= {}).errors ||= {})[task.kind] = { msg: String(e.message).slice(0, 500), at: Date.now() };
       log.failed++;
       log.errors.push(`${task.sym} ${task.kind}: ${e.message}`);
       changed = true;
     }
+    remaining = Math.max(0, remaining - 1);
+    if (changed) state.dataAt = Date.now();
+    await checkpoint();
   }
 
-  // Types detected / holdings loaded this run reveal new work (ETF holdings, constituents). Re-plan while budget remains.
-  for (let pass = 0; pass < 2 && !log.stoppedBy && budget.left > 1; pass++) {
-    const hm2 = await loadHoldingsMap(env, cfg, state);
-    const again = planTasks(env, cfg, state, hm2, Date.now()).tasks;
-    if (!again.length) break;
-    for (const task of again) {
-      if (Date.now() - t0 > maxMs) { log.stoppedBy = 'time'; break; }
-      if (!budget.canSpend(task.cost)) { log.stoppedBy = 'budget'; break; }
-      try {
-        if ((await runTask(env, budget, task, cfg, state, start)) === false) continue;
-        if (state.syms[task.sym].errors) delete state.syms[task.sym].errors[task.kind];
-        log.done++; changed = true;
-      } catch (e) {
-        if (e instanceof RateLimitError) { log.stoppedBy = 'rate-limit'; log.errors.push(e.message); break; }
-        ((state.syms[task.sym] ||= {}).errors ||= {})[task.kind] = { msg: String(e.message).slice(0, 500), at: Date.now() };
-        log.failed++;
-        log.errors.push(`${task.sym} ${task.kind}: ${e.message}`);
-      }
+  if (changed || !state.baseAt || state.cfgVersion !== cfg.version) {
+    try {
+      await rebuildBase(env, cfg, state);
+      state.baseAt = Date.now();
+      state.cfgVersion = cfg.version;
+    } catch (e) {
+      log.errors.push(`snapshot rebuild: ${e.message}`); // dashboard rebuilds on next load
     }
   }
-
-  const needBase = changed || !state.baseAt || state.cfgVersion !== cfg.version || Date.now() - state.baseAt > 3 * H;
-  if (needBase) {
-    await rebuildBase(env, cfg, state);
-    state.baseAt = Date.now();
-    state.cfgVersion = cfg.version;
-  }
-  state.lastRun = { at: t0, ms: Date.now() - t0, avCalls: budget.used, fmpCalls: budget.fmpUsed, ...log, remaining: Math.max(0, tasks.length - log.done - log.failed) };
-  await kvPut(env, 'state', state);
+  await checkpoint();
+  await env.PE_KV.delete('lock').catch(() => {});
   return state.lastRun;
 }
 
@@ -242,8 +252,15 @@ export async function loadEntity(env, sym, type, memo = new Map()) {
 export async function rebuildBase(env, cfg, state) {
   const today = todayISO();
   const memo = new Map();
-  const rows = [];
-  for (const b of cfg.basket) {
+  // prefetch every earnings record in parallel (sequential KV reads are the slow part)
+  const holdingsMap = await loadHoldingsMap(env, cfg, state);
+  const need = new Set(cfg.basket.map((b) => b.symbol));
+  holdingsMap.forEach((h) => (h.items || []).forEach((i) => need.add(i.symbol)));
+  await Promise.all([...need].map(async (s) => {
+    const f = await kvGet(env, `fund:${s}`);
+    memo.set(s, { fund: f, series: buildQuarterSeries(f) });
+  }));
+  const rows = await Promise.all(cfg.basket.map(async (b) => {
     const st = state.syms[b.symbol] || {};
     const type = entityType(b, st);
     const ent = await loadEntity(env, b.symbol, type, memo);
@@ -268,9 +285,9 @@ export async function rebuildBase(env, cfg, state) {
       else if (withData < items.length) row.warnings.push(`EPS loaded for ${withData}/${items.length} holdings so far.`);
     }
     if (row.errors.length && row.status === 'pending') row.status = 'error';
-    rows.push(row);
-  }
-  const base = { builtAt: Date.now(), today, events: cfg.events, rows };
+    return row;
+  }));
+  const base = { builtAt: Date.now(), cfgVersion: cfg.version, today, events: cfg.events, rows };
   await kvPut(env, 'base', base);
   return base;
 }

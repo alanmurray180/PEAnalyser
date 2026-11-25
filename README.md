@@ -66,7 +66,7 @@ Optional: connect the repo in Cloudflare (Workers → Settings → Builds, root 
 
 ### 3. First load
 
-The cron runs every 15 minutes and works through missing data first, within `AV_CALLS_PER_RUN`. The default basket needs about 100 symbols' earnings (ETF holdings included), roughly 200 AV calls. That takes 3–4 cycles (about an hour). **Refresh** queues an extra cycle immediately.
+The cron runs every 5 minutes. Each run is time-boxed to `RUN_SECONDS` (20 s), because Cloudflare stops background work after about 30 s. It saves progress after every fetch and works through missing data first. The default basket needs about 100 symbols' earnings (ETF holdings included), roughly 200 AV calls, so the first full load takes about an hour. Settings → **Data status** shows the last run and any per-symbol errors.
 
 ## Data sources and fallbacks
 

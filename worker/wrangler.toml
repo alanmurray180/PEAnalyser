@@ -2,9 +2,10 @@ name = "pe-analyser"
 main = "src/index.js"
 compatibility_date = "2025-10-01"
 
-# Every 15 minutes: fetch whatever is missing or stale (within the AV call budget), then rebuild the snapshot.
+# Every 5 minutes: fetch whatever is missing or stale for up to RUN_SECONDS, saving progress after each
+# fetch, then rebuild the snapshot. Short runs because Cloudflare stops background work after ~30 s.
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["*/5 * * * *"]
 
 # Create with:  npx wrangler kv namespace create PE_KV   and paste the id below.
 [[kv_namespaces]]
@@ -19,6 +20,7 @@ cpu_ms = 60000   # Workers Paid plan; ignored on Free
 ALLOWED_ORIGINS = "https://alanmurray180.github.io"
 # Alpha Vantage paid tier controls
 AV_CALLS_PER_RUN = "60"      # max AV calls per cron run
+RUN_SECONDS = "20"           # time box per run (keep under 30)
 AV_CALLS_PER_MIN = "70"      # throttle to stay inside your AV per-minute limit
 AV_ENTITLEMENT = "realtime"  # "realtime", "delayed" or "" depending on your AV plan
 # Quote routing: tried in order until every symbol has a price

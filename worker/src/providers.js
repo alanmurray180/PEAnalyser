@@ -42,7 +42,7 @@ export async function av(env, budget, params) {
   const j = await res.json();
   const msg = j['Error Message'] || j.Note || j.Information;
   if (msg) {
-    if (/frequency|rate limit|per minute|per day|spreading out/i.test(msg)) throw new RateLimitError(`Alpha Vantage: ${msg}`);
+    if (/frequency|rate limit|per minute|per day|spreading out|call volume|higher api/i.test(msg)) throw new RateLimitError(`Alpha Vantage: ${msg}`);
     if (/premium/i.test(msg)) throw new PremiumError(`Alpha Vantage: ${msg}`);
     throw new Error(`Alpha Vantage: ${msg}`);
   }
@@ -74,11 +74,11 @@ export async function avEstimates(env, budget, symbol) {
 }
 
 /** Daily history, split-adjusted only (not dividend-adjusted), from the raw close and split coefficients. */
-export async function avHistory(env, budget, symbol, fromDate) {
+export async function avHistory(env, budget, symbol, fromDate, compact = false) {
   const j = await av(env, budget, {
     function: 'TIME_SERIES_DAILY_ADJUSTED',
     symbol: avSym(symbol),
-    outputsize: 'full',
+    outputsize: compact ? 'compact' : 'full',
     entitlement: env.AV_ENTITLEMENT || undefined,
   });
   const ts = j['Time Series (Daily)'];
@@ -298,12 +298,40 @@ export async function fetchFundamentals(env, budget, symbol) {
   return { symbol, fetchedAt: Date.now(), quarters: act.value, qEst: est.qEst, fyEst: est.fyEst, basis, notes: [...act.errors, ...estErrors] };
 }
 
-export async function fetchHistory(env, budget, symbol, fromDate) {
+/**
+ * Daily history. With a previous snapshot, fetch only the recent window (AV compact = 100 days) and
+ * append it; if the overlap disagrees (a new split re-based old prices), fall back to a full refetch.
+ */
+export async function fetchHistory(env, budget, symbol, fromDate, prev = null) {
+  const prevRows = prev?.rows || [];
+  if (prevRows.length > 20) {
+    const lastPrev = prevRows[prevRows.length - 1][0];
+    const ageDays = (Date.now() - Date.parse(lastPrev + 'T00:00:00Z')) / 864e5;
+    if (ageDays < 120) {
+      try {
+        const r = await firstOk([
+          ['av', () => avHistory(env, budget, symbol, '1900-01-01', true)],
+          ['fmp', () => fmpHistory(env, budget, symbol, new Date(Date.now() - 150 * 864e5).toISOString().slice(0, 10))],
+        ]);
+        const recent = r.value;
+        const prevClose = new Map(prevRows.map((x) => [x[0], x[3]]));
+        const overlap = recent.filter((x) => prevClose.has(x[0]));
+        const consistent = overlap.length >= 3 && overlap.every((x) => Math.abs(x[3] / prevClose.get(x[0]) - 1) < 0.005);
+        if (consistent && recent.length) {
+          const firstNew = recent[0][0];
+          const rows = prevRows.filter((x) => x[0] < firstNew).concat(recent);
+          return { symbol, fetchedAt: Date.now(), from: fromDate, source: r.source, rows, mode: 'incremental' };
+        }
+      } catch (e) {
+        if (e instanceof RateLimitError) throw e;
+      }
+    }
+  }
   const r = await firstOk([
     ['av', () => avHistory(env, budget, symbol, fromDate)],
     ['fmp', () => fmpHistory(env, budget, symbol, fromDate)],
   ]);
-  return { symbol, fetchedAt: Date.now(), from: fromDate, source: r.source, rows: r.value };
+  return { symbol, fetchedAt: Date.now(), from: fromDate, source: r.source, rows: r.value, mode: 'full' };
 }
 
 export async function fetchMeta(env, budget, symbol) {

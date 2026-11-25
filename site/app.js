@@ -165,9 +165,11 @@ function render() {
   const lr = d.status?.lastRun;
   const bits = [`Prices ${qt}${src ? ` (${src})` : ''}`, `fundamentals snapshot ${ago(d.baseBuiltAt)}`];
   if (d.status?.pending) bits.push(`${d.status.pending} loading`);
-  if (lr?.remaining) bits.push(`${lr.remaining} fetches queued`);
-  if (lr?.stoppedBy === 'rate-limit') bits.push('AV rate limit hit on last run');
-  setStatus(bits.join(' · '), lr?.stoppedBy === 'rate-limit');
+  if (lr) bits.push(`last data run ${ago(lr.at)}: ${lr.done} fetched${lr.failed ? `, ${lr.failed} failed` : ''}${lr.remaining ? `, ${lr.remaining} queued` : ''}`);
+  else bits.push('no data run has completed yet');
+  if (lr?.stoppedBy === 'rate-limit') bits.push('AV rate limit hit');
+  if (d.status?.errorCount) bits.push(`${d.status.errorCount} symbols with errors (see Settings)`);
+  setStatus(bits.join(' · '), lr?.stoppedBy === 'rate-limit' || !lr);
   document.querySelectorAll('.seg').forEach((seg) => seg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(S.opts[seg.dataset.key] === b.dataset.v))));
   renderTiles();
   renderTable();
@@ -447,8 +449,29 @@ document.addEventListener('pointermove', (e) => {
 
 // ---------------- settings ----------------
 
+async function loadDiagnostics() {
+  const el = $('#s-diag');
+  if (!el) return;
+  try {
+    const st = await api('/api/status');
+    const lr = st.lastRun;
+    const errs = st.syms.filter((x) => x.errors && Object.keys(x.errors).length);
+    el.innerHTML =
+      (lr
+        ? `<p>Last run ${ago(lr.at)} (${(lr.ms / 1000).toFixed(1)} s): ${lr.done} fetched, ${lr.failed} failed, ${lr.remaining} queued; AV calls ${lr.avCalls}, FMP calls ${lr.fmpCalls}${lr.stoppedBy ? `; stopped by ${esc(lr.stoppedBy)}` : ''}.</p>`
+        : '<p>No run has completed yet.</p>') +
+      (errs.length
+        ? `<ul class="notes">${errs.map((x) => Object.entries(x.errors).map(([k, v]) => `<li><b>${esc(x.symbol)}</b> ${esc(k)}: ${esc(v.msg)}</li>`).join('')).join('')}</ul>`
+        : '<p>No symbol errors.</p>') +
+      (lr?.errors?.length ? `<p>Last run messages:</p><ul class="notes">${lr.errors.slice(0, 10).map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : '');
+  } catch (e) {
+    el.textContent = 'Diagnostics unavailable: ' + e.message;
+  }
+}
+
 function openSettings(msg) {
   const dlg = $('#settings');
+  if (S.token || !msg) loadDiagnostics();
   $('#s-api').value = S.apiBase && !S.apiBase.includes('REPLACE-ME') ? S.apiBase : '';
   $('#s-token').value = S.token;
   if (msg) setStatus(msg, true);

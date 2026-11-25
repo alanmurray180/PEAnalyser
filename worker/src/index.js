@@ -48,12 +48,10 @@ async function dashboard(env, ctx) {
   let base = await kvGet(env, 'base');
   const cfg = await loadConfig(env);
   const state = await loadState(env);
-  if (!base || state.cfgVersion !== cfg.version) {
+  // Rebuild here only if the snapshot is missing or older than the data/config (e.g. a run was cut off
+  // before it could rebuild). Never start fetches from a page load: that caused overlapping runs.
+  if (!base || base.cfgVersion !== cfg.version || (state.dataAt && base.builtAt < state.dataAt)) {
     base = await rebuildBase(env, cfg, state);
-    if (state.cfgVersion !== cfg.version) {
-      // nudge a small fetch cycle for anything newly added
-      ctx.waitUntil(runRefresh(env, { avCalls: 20, maxMs: 25000 }).catch(() => {}));
-    }
   }
   const symbols = base.rows.map((r) => r.symbol);
   const q = await liveQuotes(env, symbols);
@@ -72,7 +70,11 @@ async function dashboard(env, ctx) {
     quoteNotes: q.notes,
     events: base.events,
     rows,
-    status: { pending, lastRun: state.lastRun || null },
+    status: {
+      pending,
+      lastRun: state.lastRun || null,
+      errorCount: Object.values(state.syms).filter((v) => v.errors && Object.keys(v.errors).length).length,
+    },
   };
 }
 
@@ -110,7 +112,7 @@ export default {
           if (body.type === 'stock' || body.type === 'etf') entry.type = body.type;
           cfg.basket.push(entry);
           await saveConfig(env, cfg);
-          ctx.waitUntil(runRefresh(env, { avCalls: 20, maxMs: 25000, force: [sym] }).catch(() => {}));
+          ctx.waitUntil(runRefresh(env, { force: [sym] }).catch(() => {}));
         }
         return json(cfg, 200, cors);
       }
@@ -145,7 +147,7 @@ export default {
       if (req.method === 'POST' && path === '/api/refresh') {
         const body = await req.json().catch(() => ({}));
         const force = Array.isArray(body.symbols) ? body.symbols : body.symbol ? [body.symbol] : [];
-        ctx.waitUntil(runRefresh(env, { avCalls: 20, maxMs: 25000, force }).catch(() => {}));
+        ctx.waitUntil(runRefresh(env, { force }).catch(() => {}));
         return json({ queued: true }, 202, cors);
       }
 
