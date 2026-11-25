@@ -9,7 +9,7 @@ crons = ["*/15 * * * *"]
 # Create with:  npx wrangler kv namespace create PE_KV   and paste the id below.
 [[kv_namespaces]]
 binding = "PE_KV"
-id = 825c503d04674d218c389ee2d2c74933
+id = "825c503d04674d218c389ee2d2c74933"
 
 [limits]
 cpu_ms = 60000   # Workers Paid plan; ignored on Free
