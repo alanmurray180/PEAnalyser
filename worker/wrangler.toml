@@ -21,7 +21,7 @@ ALLOWED_ORIGINS = "https://alanmurray180.github.io"
 # Alpha Vantage paid tier controls
 AV_CALLS_PER_RUN = "60"      # max AV calls per cron run
 RUN_SECONDS = "20"           # time box per run (keep under 30)
-AV_CALLS_PER_MIN = "70"      # throttle to stay inside your AV per-minute limit
+AV_CALLS_PER_MIN = "25"      # throttle to stay inside your AV per-minute limit (key may be shared)
 AV_ENTITLEMENT = "realtime"  # "realtime", "delayed" or "" depending on your AV plan
 # Quote routing: tried in order until every symbol has a price
 QUOTE_PROVIDERS = "av_bulk,fmp_batch,fmp,av"
